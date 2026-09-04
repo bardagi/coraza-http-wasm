@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -28,8 +26,29 @@ func init() {
 	operators.Register()
 }
 
+// statusInternalServerError avoids pulling net/http into the guest for a
+// single constant.
+const statusInternalServerError = 500
+
 var waf coraza.WAF
 var txs = map[uint32]types.Transaction{}
+
+// lastReqCtx backs newReqCtx. The guest is built with -scheduler=none and wasm
+// instances are single threaded, so this needs no synchronisation.
+var lastReqCtx uint32
+
+// newReqCtx returns the key a transaction is parked under in txs until
+// handleResponse claims it. Zero is reserved by the ABI to mean "no context",
+// and a repeat would strand the transaction it displaced (never closed, never
+// logged, holding its body buffers), so never return it.
+func newReqCtx() uint32 {
+	lastReqCtx++
+	if lastReqCtx == 0 {
+		lastReqCtx = 1
+	}
+
+	return lastReqCtx
+}
 
 // main ensures buffering is available on the host.
 //
@@ -113,23 +132,34 @@ func getConfigFromHost(host api.Host) (config, error) {
 	return cfg, nil
 }
 
+func toHostSeverity(severity types.RuleSeverity) api.LogLevel {
+	switch severity {
+	case types.RuleSeverityEmergency,
+		types.RuleSeverityAlert,
+		types.RuleSeverityCritical,
+		types.RuleSeverityError:
+		return api.LogLevelError
+	case types.RuleSeverityWarning:
+		return api.LogLevelWarn
+	case types.RuleSeverityNotice,
+		types.RuleSeverityInfo:
+		return api.LogLevelInfo
+	default:
+		return api.LogLevelDebug
+	}
+}
+
 func errorCb(host api.Host) func(types.MatchedRule) {
 	return func(mr types.MatchedRule) {
-		logMsg := mr.ErrorLog()
-		switch mr.Rule().Severity() {
-		case types.RuleSeverityEmergency,
-			types.RuleSeverityAlert,
-			types.RuleSeverityCritical,
-			types.RuleSeverityError:
-			host.Log(api.LogLevelError, logMsg)
-		case types.RuleSeverityWarning:
-			host.Log(api.LogLevelWarn, logMsg)
-		case types.RuleSeverityNotice,
-			types.RuleSeverityInfo:
-			host.Log(api.LogLevelInfo, logMsg)
-		case types.RuleSeverityDebug:
-			host.Log(api.LogLevelDebug, logMsg)
+		lvl := toHostSeverity(mr.Rule().Severity())
+		// Ask the host before formatting: ErrorLog() builds the message with a
+		// strings.Builder and several Fprintf calls, and a ruleset doing
+		// anomaly scoring matches many rules per request.
+		if !host.LogEnabled(lvl) {
+			return
 		}
+
+		host.Log(lvl, mr.ErrorLog())
 	}
 }
 
@@ -161,10 +191,19 @@ func initializeWAF(host api.Host) (coraza.WAF, error) {
 
 	wafConfig = wafConfig.WithDebugLogger(debuglog.DefaultWithPrinterFactory(func(io.Writer) debuglog.Printer {
 		return func(lvl debuglog.Level, message, fields string) {
-			host.Log(toHostLevel(lvl), message+" "+fields)
-			// TODO understand. 3 works.
-			// But I can't print everything as error
-			// host.Log(toHostLevel(3), message+" "+fields)
+			hostLvl := toHostLevel(lvl)
+			// Coraza's default logger emits at Info and above regardless of the
+			// host's own level, so check before concatenating.
+			if !host.LogEnabled(hostLvl) {
+				return
+			}
+
+			if fields == "" {
+				host.Log(hostLvl, message)
+				return
+			}
+
+			host.Log(hostLvl, message+" "+fields)
 		}
 	})).WithErrorCallback(errorCb(host))
 
@@ -217,9 +256,17 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 	// There is no socket access in the request object, so we neither know the server client nor port.
 	tx.ProcessConnection(client, cport, "", 0)
 	tx.ProcessURI(req.GetURI(), req.GetMethod(), req.GetProtocolVersion())
+	// contentLength is picked up from the loop below rather than with a
+	// dedicated Headers().Get call, which would cost an extra host call.
+	contentLength, hasContentLength := 0, false
+
 	headers := req.Headers()
 	for _, k := range headers.Names() {
 		if hs := headers.GetAll(k); len(hs) > 0 {
+			if !hasContentLength && strings.EqualFold(k, "content-length") {
+				contentLength, hasContentLength = parseContentLength(hs[0])
+			}
+
 			tx.AddRequestHeader(k, strings.Join(hs, "; "))
 		}
 	}
@@ -238,11 +285,14 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 		return
 	}
 
-	if tx.IsRequestBodyAccessible() {
-		// We only do body buffering if the transaction requires request
-		// body inspection, otherwise we just let the request follow its
-		// regular flow.
-		it, _, err := tx.ReadRequestBodyFrom(readWriterTo{req.Body()})
+	// A body declared empty is skipped outright: Coraza would copy zero bytes
+	// but still allocate a copy buffer to do it.
+	hasBody := !hasContentLength || contentLength > 0
+
+	// We only do body buffering if the transaction requires request body
+	// inspection, otherwise we just let the request follow its regular flow.
+	if tx.IsRequestBodyAccessible() && hasBody {
+		it, _, err := tx.ReadRequestBodyFrom(newBodyReader(req.Body(), contentLength, hasContentLength))
 		if err != nil {
 			tx.DebugLogger().Error().Err(err).Msg("Failed to read request body")
 			return
@@ -266,7 +316,7 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 		return
 	}
 
-	reqCtx = rand.Uint32()
+	reqCtx = newReqCtx()
 	txs[reqCtx] = tx
 	return true, reqCtx
 }
@@ -322,8 +372,9 @@ func handleResponse(reqCtx uint32, req api.Request, resp api.Response, isError b
 		return
 	}
 
-	for _, h := range resp.Headers().Names() {
-		tx.AddResponseHeader(h, strings.Join(resp.Headers().GetAll(h), ";"))
+	respHeaders := resp.Headers()
+	for _, h := range respHeaders.Names() {
+		tx.AddResponseHeader(h, strings.Join(respHeaders.GetAll(h), ";"))
 	}
 
 	statusCode := resp.GetStatusCode()
@@ -333,26 +384,35 @@ func handleResponse(reqCtx uint32, req api.Request, resp api.Response, isError b
 		return
 	}
 
-	it, _, err := tx.ReadResponseBodyFrom(readWriterTo{resp.Body()})
-	if err != nil {
-		tx.DebugLogger().Error().Err(err).Msg("Failed to read response body")
-		resp.SetStatusCode(http.StatusInternalServerError)
-		return
-	}
-	if it != nil {
-		resp.Headers().Set("Content-Length", "0")
-		resp.Body().Write(nil)
-		handleInterruption(it, resp)
-		return
+	// Mirrors the request path: Coraza already returns early when response body
+	// access is off, so this only avoids building the reader and calling in.
+	//
+	// Note the response body is deliberately not read as a sizedBodyReader. A
+	// response Content-Length is a header the upstream handler chose; unlike a
+	// request's, it does not frame the body the host hands us, so trusting it
+	// could bound what the WAF inspects to less than what is actually sent.
+	if tx.IsResponseBodyAccessible() {
+		it, _, err := tx.ReadResponseBodyFrom(bodyReader{resp.Body()})
+		if err != nil {
+			tx.DebugLogger().Error().Err(err).Msg("Failed to read response body")
+			resp.SetStatusCode(statusInternalServerError)
+			return
+		}
+		if it != nil {
+			respHeaders.Set("Content-Length", "0")
+			resp.Body().Write(nil)
+			handleInterruption(it, resp)
+			return
+		}
 	}
 
 	if tx.IsResponseBodyAccessible() && tx.IsResponseBodyProcessable() {
 		if it, err := tx.ProcessResponseBody(); err != nil {
-			resp.SetStatusCode(http.StatusInternalServerError)
+			resp.SetStatusCode(statusInternalServerError)
 			tx.DebugLogger().Error().Err(err).Msg("Failed to process response body")
 			return
 		} else if it != nil {
-			resp.Headers().Set("Content-Length", "0")
+			respHeaders.Set("Content-Length", "0")
 			resp.Body().Write(nil)
 			resp.SetStatusCode(obtainStatusCodeFromInterruptionOrDefault(it, statusCode))
 			return

@@ -167,6 +167,11 @@ func Test() error {
 	return sh.RunV("go", "test", "./...")
 }
 
+// Bench runs the guest benchmarks. Requires a prior `mage build`.
+func Bench() error {
+	return sh.RunV("go", "test", "-run=^$", "-bench=.", "-benchmem", ".")
+}
+
 // E2e runs e2e tests
 func E2e() error {
 	return sh.RunV("go", "test", "-count=1", "-run=^TestE2E", "-tags=e2e", "-v", ".")
