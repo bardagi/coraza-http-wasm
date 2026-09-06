@@ -21,9 +21,9 @@ import (
 var Default = Build
 
 var (
-	minGoVersion     = "1.22"
+	minGoVersion     = "1.23"
 	minTinygoVersion = "0.33.0"
-	golangCILintVer  = "v1.61.0" // https://github.com/golangci/golangci-lint/releases
+	golangCILintVer  = "v2.13.2" // https://github.com/golangci/golangci-lint/releases
 	gosImportsVer    = "v0.3.8"  // https://github.com/rinchsan/gosimports/releases/tag/v0.3.1
 )
 
@@ -115,7 +115,7 @@ func Format() error {
 
 // Lint verifies code format.
 func Lint() error {
-	if err := sh.RunV("go", "run", fmt.Sprintf("github.com/golangci/golangci-lint/cmd/golangci-lint@%s", golangCILintVer), "run"); err != nil {
+	if err := sh.RunV("go", "run", fmt.Sprintf("github.com/golangci/golangci-lint/v2/cmd/golangci-lint@%s", golangCILintVer), "run"); err != nil {
 		return err
 	}
 

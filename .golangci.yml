@@ -1,25 +1,29 @@
+version: "2"
+
 run:
-  deadline: 5m
+  timeout: 5m
 
 linters:
-  disable-all: true
+  default: none
   enable:
-    # Enabled by default, see https://golangci-lint.run/usage/linters#enabled-by-default
-    - deadcode
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
-    - structcheck
-    - typecheck
     - unused
-    - varcheck
-    - goimports
-    - gofmt
     - gocritic
-issues:
-  exclude-rules:
-    - path: magefile\.go
-      linters:
-        - deadcode
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: magefile\.go
+        linters:
+          - unused
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -116,7 +116,7 @@ Include @owasp_crs/*.conf
 		if err != nil {
 			return err
 		}
-		ftwt, err := test.GetTestFromYaml(yaml)
+		ftwt, err := test.GetTestFromYaml(yaml, path)
 		if err != nil {
 			return err
 		}
@@ -151,7 +151,7 @@ Include @owasp_crs/*.conf
 	cfg.TestOverride.Overrides.DestAddr = &host
 	cfg.TestOverride.Overrides.Port = &port
 
-	res, err := runner.Run(cfg, tests, runner.RunnerConfig{
+	res, err := runner.Run(cfg, tests, &runner.RunnerConfig{
 		ShowTime:    false,
 		ReadTimeout: 5 * time.Second,
 	}, output.NewOutput("quiet", os.Stdout))

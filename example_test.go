@@ -9,7 +9,6 @@ import (
 
 	"github.com/http-wasm/http-wasm-host-go/handler"
 	nethttp "github.com/http-wasm/http-wasm-host-go/handler/nethttp"
-	wasm "github.com/http-wasm/http-wasm-host-go/handler/nethttp"
 	"github.com/tetratelabs/wazero"
 )
 
@@ -24,7 +23,7 @@ func exampleHandler(w http.ResponseWriter, req *http.Request) {
 func ExampleMain() {
 	ctx := context.Background()
 
-	h, err := wasm.NewMiddleware(
+	h, err := nethttp.NewMiddleware(
 		ctx,
 		[]byte(guest),
 		handler.GuestConfig([]byte(`
