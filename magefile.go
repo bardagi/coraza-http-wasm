@@ -134,7 +134,13 @@ func Build() error {
 		return err
 	}
 
-	err := sh.RunV("tinygo", "build", "-o", filepath.Join("build", "coraza-http-wasm-raw.wasm"), "-opt=2", "-gc=custom", "-tags='custommalloc no_fs_access'", "-scheduler=none", "--no-debug", "-target=wasip1")
+	// TinyGo enforces its own supported Go version range (0.33.0 requires 1.19-1.23), and
+	// a Go stdlib newer than 1.23 pulls in a crypto/rand watchdog timer (via net/http, used
+	// by coraza's actions package) that starts a goroutine, which fails to compile under
+	// -scheduler=none. Pin the toolchain tinygo uses so this keeps building regardless of
+	// which Go is the local default.
+	env := map[string]string{"GOTOOLCHAIN": "go1.23.0"}
+	err := sh.RunWithV(env, "tinygo", "build", "-o", filepath.Join("build", "coraza-http-wasm-raw.wasm"), "-opt=2", "-gc=custom", "-tags=custommalloc,no_fs_access", "-scheduler=none", "--no-debug", "-target=wasip1")
 	if err != nil {
 		return err
 	}
