@@ -98,6 +98,7 @@ Include @owasp_crs/*.conf
 	if err != nil {
 		t.Fatalf("failed to create error log: %v", err)
 	}
+	defer errorFile.Close()
 
 	mw, err := wasm.NewMiddleware(
 		context.Background(),
@@ -145,6 +146,9 @@ Include @owasp_crs/*.conf
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	cfg, err := config.NewConfigFromFile(".ftw.yml")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.LoadPlatformOverrides("overrides.yaml"); err != nil {
 		t.Fatal(err)
 	}
 	cfg.WithLogfile(errorPath)

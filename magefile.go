@@ -225,5 +225,7 @@ func FTW() error {
 	}
 	defer os.Remove(binDst)
 
-	return sh.RunV("go", "test", "-count=1", "./testing/coreruleset")
+	// The full CRS suite can exceed Go's default ten-minute timeout,
+	// particularly on Windows and when running the WASM guest.
+	return sh.RunV("go", "test", "-count=1", "-timeout=30m", "./testing/coreruleset")
 }

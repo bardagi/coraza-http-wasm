@@ -1,0 +1,15 @@
+version: v0.1.0
+meta:
+  engine: coraza
+  platform: http-wasm
+test_overrides:
+  - rule_id: 920620
+    test_ids: [1]
+    reason: >-
+      The HTTP-Wasm connector preserves separate Content-Type values, unlike
+      Apache's header merging assumed by this case. Require detection of the
+      duplicate headers. The FTW fixture runs in DetectionOnly mode.
+    output:
+      status: 200
+      log:
+        expect_ids: [920620]

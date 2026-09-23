@@ -18,7 +18,10 @@ type byteLenger interface {
 type fakeBody struct {
 	api.Body
 	remaining string
+	written   string
 }
+
+func (b *fakeBody) Write(p []byte) { b.written += string(p) }
 
 func (b *fakeBody) Read(p []byte) (uint32, bool) {
 	n := copy(p, b.remaining)

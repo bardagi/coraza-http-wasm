@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -55,19 +56,14 @@ func newReqCtx() uint32 {
 // Note: required features does not include api.FeatureTrailers because some
 // hosts don't support them, and the impact is minimal for logging.
 func main() {
-	requiredFeatures := api.FeatureBufferRequest | api.FeatureBufferResponse
-	if want, have := requiredFeatures, httpwasm.Host.EnableFeatures(requiredFeatures); !have.IsEnabled(want) {
-		httpwasm.Host.Log(api.LogLevelError, "Unexpected features, want: "+want.String()+", have: "+have.String())
-	}
-	httpwasm.HandleRequestFn = handleRequest
-	httpwasm.HandleResponseFn = handleResponse
-
 	var err error
 	waf, err = initializeWAF(httpwasm.Host)
 	if err != nil {
 		httpwasm.Host.Log(api.LogLevelError, fmt.Sprintf("Failed to initialize WAF: %v", err))
 		os.Exit(1)
 	}
+	httpwasm.HandleRequestFn = handleRequest
+	httpwasm.HandleResponseFn = handleResponse
 }
 
 func toHostLevel(lvl debuglog.Level) api.LogLevel {
@@ -93,17 +89,17 @@ type config struct {
 func getConfigFromHost(host api.Host) (config, error) {
 	cfg := config{includeCRS: true}
 
-	if len(host.GetConfig()) == 0 {
-		return cfg, nil
-	}
-
+	raw := host.GetConfig()
 	var directives = strings.Builder{}
-	cfgAsJSON := gjson.ParseBytes(host.GetConfig())
-	if !cfgAsJSON.Exists() {
+	cfgAsJSON := gjson.ParseBytes(raw)
+	if !gjson.ValidBytes(raw) || !cfgAsJSON.IsObject() {
 		return config{}, errors.New("invalid host config")
 	}
 
 	if includeCRSRes := cfgAsJSON.Get("includeCRS"); includeCRSRes.Exists() {
+		if includeCRSRes.Type != gjson.True && includeCRSRes.Type != gjson.False {
+			return config{}, errors.New("invalid host config, boolean expected for field includeCRS")
+		}
 		cfg.includeCRS = includeCRSRes.Bool()
 	}
 
@@ -112,19 +108,18 @@ func getConfigFromHost(host api.Host) (config, error) {
 		return config{}, errors.New("invalid host config, array expected for field directives")
 	}
 
-	isFirst := true
-	directivesResult.ForEach(func(key, value gjson.Result) bool {
-		if isFirst {
-			isFirst = false
-		} else {
+	for i, value := range directivesResult.Array() {
+		if value.Type != gjson.String {
+			return config{}, fmt.Errorf("invalid host config, string expected for directives[%d]", i)
+		}
+		if i > 0 {
 			directives.WriteByte('\n')
 		}
 
 		directives.WriteString(value.Str)
-		return true
-	})
+	}
 
-	if directives.Len() == 0 {
+	if strings.TrimSpace(directives.String()) == "" {
 		return config{}, errors.New("empty directives")
 	}
 
@@ -164,6 +159,10 @@ func errorCb(host api.Host) func(types.MatchedRule) {
 }
 
 func initializeWAF(host api.Host) (coraza.WAF, error) {
+	requiredFeatures := api.FeatureBufferRequest | api.FeatureBufferResponse
+	if have := host.EnableFeatures(requiredFeatures); have&requiredFeatures != requiredFeatures {
+		return nil, fmt.Errorf("required buffering unavailable, want: %s, have: %s", requiredFeatures, have)
+	}
 	wafConfig := coraza.NewWAFConfig()
 
 	if cfg, err := getConfigFromHost(host); err == nil {
@@ -173,18 +172,14 @@ func initializeWAF(host api.Host) (coraza.WAF, error) {
 			wafConfig = wafConfig.WithRootFS(fsio.OSFS)
 		}
 
-		if cfg.directives == "" {
-			host.Log(api.LogLevelWarn, "Initializing WAF with no directives")
-		} else {
-			if host.LogEnabled(api.LogLevelDebug) {
-				if cfg.includeCRS {
-					host.Log(api.LogLevelDebug, "Initializing WAF with CRS embedded and directives:\n"+cfg.directives)
-				} else {
-					host.Log(api.LogLevelDebug, "Initializing WAF with directives:\n"+cfg.directives)
-				}
+		if host.LogEnabled(api.LogLevelDebug) {
+			if cfg.includeCRS {
+				host.Log(api.LogLevelDebug, "Initializing WAF with CRS embedded and directives:\n"+cfg.directives)
+			} else {
+				host.Log(api.LogLevelDebug, "Initializing WAF with directives:\n"+cfg.directives)
 			}
-			wafConfig = wafConfig.WithDirectives(cfg.directives)
 		}
+		wafConfig = wafConfig.WithDirectives(cfg.directives)
 	} else {
 		return nil, err
 	}
@@ -221,36 +216,17 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 	// Early return, Coraza is not going to process any rule
 	if tx.IsRuleEngineOff() {
 		next = true
-		tx.Close()
+		finishTransaction(tx)
 		return
 	}
 
 	defer func() {
-		if tx.IsInterrupted() {
-			// We run phase 5 rules and create audit logs (if enabled)
-			tx.ProcessLogging()
-		}
-
 		if !next {
-			// we remove temporary files and free some memory
-			if err := tx.Close(); err != nil {
-				tx.DebugLogger().Error().Err(err).Msg("Failed to close the transaction")
-			}
+			finishTransaction(tx)
 		}
 	}()
 
-	var (
-		client string
-		cport  int
-	)
-
-	// IMPORTANT: Some http.Request.RemoteAddr implementations will not contain port or contain IPV6: [2001:db8::1]:8080
-	srcAddress := req.GetSourceAddr()
-	idx := strings.LastIndexByte(srcAddress, ':')
-	if idx != -1 {
-		client = srcAddress[:idx]
-		cport, _ = strconv.Atoi(srcAddress[idx+1:])
-	}
+	client, cport := parseSourceAddress(req.GetSourceAddr())
 
 	var it *types.Interruption
 	// There is no socket access in the request object, so we neither know the server client nor port.
@@ -262,17 +238,22 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 
 	headers := req.Headers()
 	for _, k := range headers.Names() {
+		// Read Host separately, including hosts that omit it from Names().
+		if strings.EqualFold(k, "host") {
+			continue
+		}
 		if hs := headers.GetAll(k); len(hs) > 0 {
-			if !hasContentLength && strings.EqualFold(k, "content-length") {
+			if len(hs) == 1 && !hasContentLength && strings.EqualFold(k, "content-length") {
 				contentLength, hasContentLength = parseContentLength(hs[0])
 			}
 
-			tx.AddRequestHeader(k, strings.Join(hs, "; "))
+			for _, value := range hs {
+				tx.AddRequestHeader(k, value)
+			}
 		}
 	}
 
-	// Host will always be removed from req.Headers() and promoted to the
-	// Request.Host field, so we manually add it
+	// Feed the host-provided authority to Coraza exactly once.
 	if host, ok := headers.Get("Host"); ok {
 		tx.AddRequestHeader("Host", host)
 		// This connector relies on the host header (now host field) to populate ServerName
@@ -291,10 +272,12 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 
 	// We only do body buffering if the transaction requires request body
 	// inspection, otherwise we just let the request follow its regular flow.
-	if tx.IsRequestBodyAccessible() && hasBody {
+	bodyInspected := tx.IsRequestBodyAccessible() && hasBody
+	if bodyInspected {
 		it, _, err := tx.ReadRequestBodyFrom(newBodyReader(req.Body(), contentLength, hasContentLength))
 		if err != nil {
 			tx.DebugLogger().Error().Err(err).Msg("Failed to read request body")
+			replaceResponse(res, statusInternalServerError, "Internal Server Error\n")
 			return
 		}
 
@@ -308,12 +291,21 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 	it, err = tx.ProcessRequestBody()
 	if err != nil {
 		tx.DebugLogger().Error().Err(err).Msg("Failed to process request body")
+		replaceResponse(res, statusInternalServerError, "Internal Server Error\n")
 		return
 	}
 
 	if it != nil {
 		handleInterruption(it, res)
 		return
+	}
+
+	if bodyInspected {
+		if err := restoreRequestBody(tx, req.Body()); err != nil {
+			tx.DebugLogger().Error().Err(err).Msg("Failed to restore request body")
+			replaceResponse(res, statusInternalServerError, "Internal Server Error\n")
+			return
+		}
 	}
 
 	reqCtx = newReqCtx()
@@ -323,7 +315,44 @@ func handleRequest(req api.Request, res api.Response) (next bool, reqCtx uint32)
 
 func handleInterruption(in *types.Interruption, res api.Response) {
 	statusCode := obtainStatusCodeFromInterruptionOrDefault(in, 403)
-	res.SetStatusCode(statusCode)
+	replaceResponse(res, statusCode, "Request blocked\n")
+}
+
+// The first nonempty body write replaces the host's buffered response.
+// Empty writes are ignored by the guest SDK and cannot erase upstream data.
+func replaceResponse(res api.Response, status uint32, message string) {
+	headers := res.Headers()
+	for _, name := range headers.Names() {
+		headers.Remove(name)
+	}
+	headers.Set("Content-Type", "text/plain; charset=utf-8")
+	headers.Set("Content-Length", strconv.Itoa(len(message)))
+	headers.Set("Cache-Control", "no-store")
+	res.SetStatusCode(status)
+	res.Body().WriteString(message)
+}
+
+func finishTransaction(tx types.Transaction) {
+	tx.ProcessLogging()
+	if err := tx.Close(); err != nil {
+		tx.DebugLogger().Error().Err(err).Msg("Failed to close the transaction")
+	}
+}
+
+func parseSourceAddress(source string) (string, int) {
+	if addr, err := netip.ParseAddr(source); err == nil {
+		return addr.WithZone("").String(), 0
+	}
+	if addr, err := netip.ParseAddrPort(source); err == nil {
+		return addr.Addr().WithZone("").String(), int(addr.Port())
+	}
+	// Accept bracketed IPv6 without a port as well.
+	if strings.HasPrefix(source, "[") && strings.HasSuffix(source, "]") {
+		if addr, err := netip.ParseAddr(source[1 : len(source)-1]); err == nil && addr.Is6() {
+			return addr.WithZone("").String(), 0
+		}
+	}
+	return "", 0
 }
 
 // obtainStatusCodeFromInterruptionOrDefault returns the desired status code derived from the interruption
@@ -352,29 +381,22 @@ func handleResponse(reqCtx uint32, req api.Request, resp api.Response, isError b
 	}
 	delete(txs, reqCtx)
 
-	defer func() {
-		// We run phase 5 rules and create audit logs (if enabled)
-		tx.ProcessLogging()
-		// we remove temporary files and free some memory
-		if err := tx.Close(); err != nil {
-			tx.DebugLogger().Error().Err(err).Msg("Failed to close the transaction")
-		}
-	}()
+	defer finishTransaction(tx)
 
 	if isError {
 		return
 	}
 
-	// We look for interruptions triggered at phase 3 (response headers)
-	// and during writing the response body. If so, response status code
-	// has been sent over the flush already.
 	if tx.IsInterrupted() {
+		handleInterruption(tx.Interruption(), resp)
 		return
 	}
 
 	respHeaders := resp.Headers()
 	for _, h := range respHeaders.Names() {
-		tx.AddResponseHeader(h, strings.Join(respHeaders.GetAll(h), ";"))
+		for _, value := range respHeaders.GetAll(h) {
+			tx.AddResponseHeader(h, value)
+		}
 	}
 
 	statusCode := resp.GetStatusCode()
@@ -395,12 +417,10 @@ func handleResponse(reqCtx uint32, req api.Request, resp api.Response, isError b
 		it, _, err := tx.ReadResponseBodyFrom(bodyReader{resp.Body()})
 		if err != nil {
 			tx.DebugLogger().Error().Err(err).Msg("Failed to read response body")
-			resp.SetStatusCode(statusInternalServerError)
+			replaceResponse(resp, statusInternalServerError, "Internal Server Error\n")
 			return
 		}
 		if it != nil {
-			respHeaders.Set("Content-Length", "0")
-			resp.Body().Write(nil)
 			handleInterruption(it, resp)
 			return
 		}
@@ -408,13 +428,11 @@ func handleResponse(reqCtx uint32, req api.Request, resp api.Response, isError b
 
 	if tx.IsResponseBodyAccessible() && tx.IsResponseBodyProcessable() {
 		if it, err := tx.ProcessResponseBody(); err != nil {
-			resp.SetStatusCode(statusInternalServerError)
+			replaceResponse(resp, statusInternalServerError, "Internal Server Error\n")
 			tx.DebugLogger().Error().Err(err).Msg("Failed to process response body")
 			return
 		} else if it != nil {
-			respHeaders.Set("Content-Length", "0")
-			resp.Body().Write(nil)
-			resp.SetStatusCode(obtainStatusCodeFromInterruptionOrDefault(it, statusCode))
+			handleInterruption(it, resp)
 			return
 		}
 	}

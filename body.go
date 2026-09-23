@@ -4,6 +4,7 @@ import (
 	"io"
 	"strconv"
 
+	"github.com/corazawaf/coraza/v3/types"
 	"github.com/http-wasm/http-wasm-guest-tinygo/handler/api"
 )
 
@@ -68,4 +69,25 @@ func newBodyReader(body api.Body, length int, known bool) io.Reader {
 	}
 
 	return bodyReader{body}
+}
+
+type bodyWriter struct{ api.Body }
+
+func (w bodyWriter) Write(p []byte) (int, error) {
+	w.Body.Write(p)
+	return len(p), nil
+}
+
+// restoreRequestBody works around incomplete request buffering in the Go
+// HTTP-Wasm host v0.7.0. The first write replaces the pending request body;
+// the host's existing read stream still holds the unread original bytes.
+// Include those bytes when Coraza's ProcessPartial action inspected only a
+// prefix. Copy in chunks rather than allocating another full guest buffer.
+func restoreRequestBody(tx types.Transaction, body api.Body) error {
+	inspected, err := tx.RequestBodyReader()
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(bodyWriter{body}, io.MultiReader(inspected, bodyReader{body}))
+	return err
 }

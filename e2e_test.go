@@ -8,11 +8,12 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"github.com/corazawaf/coraza/v3/http/e2e"
 	"github.com/http-wasm/http-wasm-host-go/api"
 	"github.com/http-wasm/http-wasm-host-go/handler"
 	nethttp "github.com/http-wasm/http-wasm-host-go/handler/nethttp"
@@ -46,7 +47,6 @@ const directives = `
 `
 
 func TestE2E(t *testing.T) {
-	// TODO: replace this tests with coraza http tests
 	var stdoutBuf, stderrBuf bytes.Buffer
 	moduleConfig := wazero.NewModuleConfig().WithStdout(&stdoutBuf).WithStderr(&stderrBuf)
 
@@ -75,11 +75,48 @@ func TestE2E(t *testing.T) {
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	err = e2e.Run(e2e.Config{
-		ProxiedEntrypoint: ts.URL,
-		HttpbinEntrypoint: ts.URL,
-	})
-	require.NoError(t, err)
+	// Keep the upstream suite's scenarios locally: its runner requires empty
+	// denial bodies, whereas this connector now returns a generic message.
+	for _, tc := range []struct {
+		name, method, path, body, userAgent string
+		status                              int
+		missingConfigHeader                 bool
+	}{
+		{name: "health", method: "GET", path: "/status/200", status: 200},
+		{name: "configuration", method: "GET", path: "/", status: 424, missingConfigHeader: true},
+		{name: "allowed", method: "GET", path: "/?arg=arg_1", status: 200},
+		{name: "URI deny", method: "GET", path: "/admin", status: 403},
+		{name: "allowed body", method: "POST", path: "/anything", body: "This is a legit payload", status: 200},
+		{name: "request body deny", method: "POST", path: "/anything", body: "maliciouspayload", status: 403},
+		{name: "response header deny", method: "GET", path: "/response-headers?pass=leak", status: 403},
+		{name: "response body deny", method: "POST", path: "/anything", body: "responsebodycode", status: 403},
+		{name: "XSS", method: "GET", path: "/anything?arg=%3Cscript%3Ealert(0)%3C/script%3E", status: 403},
+		{name: "SQLi", method: "POST", path: "/anything", body: "1%27%20ORDER%20BY%203--%2B", status: 403},
+		{name: "scanner", method: "GET", path: "/anything", userAgent: "Grabber/0.1 (X11; U; Linux i686; en-US; rv:1.7)", status: 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method, ts.URL+tc.path, strings.NewReader(tc.body))
+			require.NoError(t, err)
+			if !tc.missingConfigHeader {
+				req.Header.Set("coraza-e2e", "ok")
+			}
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			}
+			if tc.userAgent != "" {
+				req.Header.Set("User-Agent", tc.userAgent)
+			}
+			resp, err := ts.Client().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, tc.status, resp.StatusCode)
+			if tc.status != 200 {
+				assertBlockedResponse(t, resp, body)
+			}
+		})
+	}
 }
 
 // testLogger is a api.Logger implementation for testing purposes.
