@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	crstests "github.com/corazawaf/coraza-coreruleset/v4/tests"
+	"github.com/coreruleset/albedo/server"
 	"github.com/coreruleset/go-ftw/config"
 	"github.com/coreruleset/go-ftw/output"
 	"github.com/coreruleset/go-ftw/runner"
@@ -24,7 +26,6 @@ import (
 	"github.com/http-wasm/http-wasm-host-go/api"
 	"github.com/http-wasm/http-wasm-host-go/handler"
 	wasm "github.com/http-wasm/http-wasm-host-go/handler/nethttp"
-	"github.com/mccutchen/go-httpbin/v2/httpbin"
 	"github.com/rs/zerolog"
 )
 
@@ -54,7 +55,7 @@ func TestFTW(t *testing.T) {
 Include @coraza.conf-recommended
 
 # Custom Rules for testing and eventually overrides of the basic Coraza config
-SecResponseBodyMimeType text/plain",
+SecResponseBodyMimeType text/plain
 SecDefaultAction "phase:3,log,auditlog,pass"
 SecDefaultAction "phase:4,log,auditlog,pass"
 SecDefaultAction "phase:5,log,auditlog,pass"
@@ -132,7 +133,15 @@ Include @owasp_crs/*.conf
 		t.Fatal("no tests found")
 	}
 
-	s := httptest.NewServer(mw.NewHandler(context.Background(), httpbin.New().Handler()))
+	// CRS regression tests expect https://github.com/coreruleset/albedo as the
+	// backend: response rule tests rely on its /reflect endpoint. The
+	// Content-Type is forced to match SecResponseBodyMimeType above so response
+	// bodies are inspected, as upstream Coraza does for its own CRS tests.
+	backend := server.Handler()
+	s := httptest.NewServer(mw.NewHandler(context.Background(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		backend.ServeHTTP(w, r)
+	})))
 	defer s.Close()
 
 	u, err := url.Parse(s.URL)
@@ -143,7 +152,13 @@ Include @owasp_crs/*.conf
 	host := u.Hostname()
 	port, _ := strconv.Atoi(u.Port())
 	// TODO(anuraaga): Don't use global config for FTW for better support of programmatic.
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	// FTW_DEBUG=1 makes go-ftw log why each failing test failed.
+	debug := os.Getenv("FTW_DEBUG") != ""
+	if debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
 	cfg, err := config.NewConfigFromFile(".ftw.yml")
 	if err != nil {
 		t.Fatal(err)
@@ -156,9 +171,10 @@ Include @owasp_crs/*.conf
 	cfg.TestOverride.Overrides.Port = &port
 
 	res, err := runner.Run(cfg, tests, &runner.RunnerConfig{
-		ShowTime:    false,
-		ReadTimeout: 5 * time.Second,
-	}, output.NewOutput("quiet", os.Stdout))
+		ShowTime:       false,
+		ShowOnlyFailed: debug,
+		ReadTimeout:    5 * time.Second,
+	}, output.NewOutput(outputMode(debug), os.Stdout))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,4 +182,12 @@ Include @owasp_crs/*.conf
 	if len(res.Stats.Failed) > 0 {
 		t.Errorf("failed tests: %v", res.Stats.Failed)
 	}
+}
+
+func outputMode(debug bool) string {
+	if debug {
+		return "normal"
+	}
+
+	return "quiet"
 }

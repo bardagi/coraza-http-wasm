@@ -13,3 +13,28 @@ test_overrides:
       status: 200
       log:
         expect_ids: [920620]
+  - rule_id: 920274
+    test_ids: [1]
+    reason: >-
+      Rule works. The test expects status 400 (Apache behaviour); the FTW
+      fixture runs in DetectionOnly mode. Same override as upstream Coraza.
+    output:
+      log:
+        expect_ids: [920274]
+  - rule_id: 922130
+    test_ids: [1, 2, 7]
+    reason: >-
+      Coraza rejects these multipart payloads at parse time with rule 200003
+      (MULTIPART_STRICT_ERROR), so 922130 is not reached. Same override as
+      upstream Coraza.
+    output:
+      log:
+        expect_ids: [200003]
+  - rule_id: 932207
+    test_ids: [7]
+    reason: >-
+      Rule works. The http-wasm host passes header names in lowercase, so the
+      matched variable is REQUEST_HEADERS:referer rather than :Referer.
+    output:
+      log:
+        match_regex: 'Matched Data: \$u found within REQUEST_HEADERS:[Rr]eferer: #x=foo;cat\$u /etc\$u/passwd'

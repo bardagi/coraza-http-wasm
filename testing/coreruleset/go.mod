@@ -5,9 +5,9 @@ go 1.23
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/corazawaf/coraza-coreruleset/v4 v4.24.0
+	github.com/coreruleset/albedo v0.0.16
 	github.com/coreruleset/go-ftw v1.3.0
 	github.com/http-wasm/http-wasm-host-go v0.7.0
-	github.com/mccutchen/go-httpbin/v2 v2.20.0
 	github.com/rs/zerolog v1.35.1
 )
 
@@ -33,6 +33,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
+	github.com/rogpeppe/go-internal v1.9.0 // indirect
 	github.com/tetratelabs/wazero v1.8.0 // indirect
 	github.com/yargevad/filepathx v1.0.0 // indirect
 	golang.org/x/crypto v0.32.0 // indirect
