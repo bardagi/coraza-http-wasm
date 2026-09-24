@@ -224,3 +224,30 @@ func TestE2ESecurityConfiguration(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "explicit pass-through", rec.Body.String())
 }
+
+func TestE2ESecurityLongRequestLine(t *testing.T) {
+	cache := wazero.NewCompilationCache()
+	t.Cleanup(func() { require.NoError(t, cache.Close(context.Background())) })
+	h := securityHandler(t, cache, `SecRuleEngine On
+SecRule REQUEST_URI "@endsWith attack" "id:1,phase:1,deny,status:418"
+SecRule REQUEST_METHOD "@endsWith attack" "id:2,phase:1,deny,status:419"`, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "allowed")
+	}))
+	// Longer than the guest SDK's 2KiB read buffer.
+	long := strings.Repeat("a", 4096)
+	for _, tc := range []struct {
+		name, method, uri string
+		status            int
+	}{
+		{"uri", "GET", "/?q=" + long, 200},
+		{"uri inspected", "GET", "/?q=" + long + "attack", 418},
+		{"method", "X" + strings.ToUpper(long), "/", 200},
+		{"method inspected", "X" + long + "attack", "/", 419},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(tc.method, "http://example.com"+tc.uri, nil))
+			require.Equal(t, tc.status, rec.Code, rec.Body.String())
+		})
+	}
+}

@@ -62,8 +62,12 @@ func main() {
 		httpwasm.Host.Log(api.LogLevelError, fmt.Sprintf("Failed to initialize WAF: %v", err))
 		os.Exit(1)
 	}
-	httpwasm.HandleRequestFn = handleRequest
-	httpwasm.HandleResponseFn = handleResponse
+	httpwasm.HandleRequestFn = func(req api.Request, res api.Response) (bool, uint32) {
+		return handleRequest(wrapRequest(req), res)
+	}
+	httpwasm.HandleResponseFn = func(reqCtx uint32, req api.Request, res api.Response, isError bool) {
+		handleResponse(reqCtx, wrapRequest(req), res, isError)
+	}
 }
 
 func toHostLevel(lvl debuglog.Level) api.LogLevel {
