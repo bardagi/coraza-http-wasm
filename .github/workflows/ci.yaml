@@ -22,6 +22,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading its build artifact on tag pushes.
+      contents: write
     steps:
       - name: Check out code
         uses: actions/checkout@v7
